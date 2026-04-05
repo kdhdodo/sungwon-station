@@ -7,47 +7,18 @@ const ICE_SERVERS = [
 ];
 
 function App() {
-  const [status, setStatus] = useState("대기 중...");
+  const [status, setStatus] = useState("waiting");
   const [cameras, setCameras] = useState([]);
   const videoRefs = useRef({});
   const pcRefs = useRef({});
+  const pollRefs = useRef({});
 
   useEffect(() => {
-    // 활성 카메라 목록 가져오기
     loadCameras();
-
-    // Supabase Realtime으로 시그널링 수신
-    const channel = supabase.channel("webrtc-signal")
-      .on("broadcast", { event: "offer" }, async ({ payload }) => {
-        const { camId, sdp } = payload;
-        await handleOffer(camId, sdp);
-      })
-      .on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
-        const { camId, candidate } = payload;
-        const pc = pcRefs.current[camId];
-        if (pc && candidate) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (e) {
-            console.error("ICE candidate error:", e);
-          }
-        }
-      })
-      .on("broadcast", { event: "camera-online" }, ({ payload }) => {
-        loadCameras();
-      })
-      .on("broadcast", { event: "camera-offline" }, ({ payload }) => {
-        const { camId } = payload;
-        if (pcRefs.current[camId]) {
-          pcRefs.current[camId].close();
-          delete pcRefs.current[camId];
-        }
-        setCameras(prev => prev.filter(c => c.id !== camId));
-      })
-      .subscribe();
-
+    const interval = setInterval(loadCameras, 5000);
     return () => {
-      channel.unsubscribe();
+      clearInterval(interval);
+      Object.values(pollRefs.current).forEach(clearInterval);
       Object.values(pcRefs.current).forEach(pc => pc.close());
     };
   }, []);
@@ -57,12 +28,56 @@ function App() {
     if (data) setCameras(data);
   };
 
-  const handleOffer = async (camId, sdp) => {
+  const requestStream = async (camId) => {
+    setStatus("requesting");
+
     // 기존 연결 정리
     if (pcRefs.current[camId]) {
       pcRefs.current[camId].close();
+      delete pcRefs.current[camId];
+    }
+    if (pollRefs.current[camId]) {
+      clearInterval(pollRefs.current[camId]);
+      delete pollRefs.current[camId];
     }
 
+    // request-stream 시그널 보내기
+    await supabase.from("sw_signals").insert({
+      cam_id: camId, type: "request-stream", data: "request"
+    });
+
+    // 시그널 폴링 시작
+    let lastId = 0;
+    pollRefs.current[camId] = setInterval(async () => {
+      const { data: signals } = await supabase.from("sw_signals")
+        .select("*")
+        .eq("cam_id", camId)
+        .gt("id", lastId)
+        .order("id");
+
+      if (!signals) return;
+
+      for (const sig of signals) {
+        lastId = sig.id;
+
+        if (sig.type === "offer") {
+          await handleOffer(camId, sig.data);
+        } else if (sig.type === "ice-candidate") {
+          const pc = pcRefs.current[camId];
+          if (pc) {
+            try {
+              const candidate = JSON.parse(sig.data);
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (e) {
+              console.error("ICE error:", e);
+            }
+          }
+        }
+      }
+    }, 1000);
+  };
+
+  const handleOffer = async (camId, sdp) => {
     const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
     pcRefs.current[camId] = pc;
 
@@ -70,24 +85,24 @@ function App() {
       const video = videoRefs.current[camId];
       if (video && event.streams[0]) {
         video.srcObject = event.streams[0];
-        setStatus("연결됨");
+        setStatus("connected");
       }
     };
 
-    pc.onicecandidate = (event) => {
+    pc.onicecandidate = async (event) => {
       if (event.candidate) {
-        supabase.channel("webrtc-signal").send({
-          type: "broadcast",
-          event: "ice-candidate-answer",
-          payload: { camId, candidate: event.candidate.toJSON() },
+        await supabase.from("sw_signals").insert({
+          cam_id: camId,
+          type: "ice-candidate-answer",
+          data: JSON.stringify(event.candidate.toJSON())
         });
       }
     };
 
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
-        setStatus("연결 끊김");
-      }
+      const state = pc.connectionState;
+      if (state === "connected") setStatus("connected");
+      else if (state === "disconnected" || state === "failed") setStatus("disconnected");
     };
 
     try {
@@ -95,30 +110,31 @@ function App() {
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
 
-      // answer를 앱으로 전송
-      await supabase.channel("webrtc-signal").send({
-        type: "broadcast",
-        event: "answer",
-        payload: { camId, sdp: answer.sdp },
+      await supabase.from("sw_signals").insert({
+        cam_id: camId, type: "answer", data: answer.sdp
       });
+
+      setStatus("connecting");
     } catch (e) {
-      console.error("Offer handling error:", e);
-      setStatus("연결 실패");
+      console.error("Offer error:", e);
+      setStatus("error");
     }
   };
 
-  const requestStream = async (camId) => {
-    setStatus("연결 요청 중...");
-    await supabase.channel("webrtc-signal").send({
-      type: "broadcast",
-      event: "request-stream",
-      payload: { camId },
-    });
+  const statusText = {
+    waiting: "Waiting...",
+    requesting: "Requesting...",
+    connecting: "Connecting...",
+    connected: "Connected",
+    disconnected: "Disconnected",
+    error: "Error"
   };
+
+  const statusColor = status === "connected" ? "#4CAF50" : "#888";
 
   return (
     <div style={{ minHeight: "100vh", padding: 24 }}>
-      {/* 헤더 */}
+      {/* Header */}
       <div style={{
         display: "flex", alignItems: "center", justifyContent: "space-between",
         marginBottom: 24, borderBottom: "1px solid #1a1d27", paddingBottom: 16
@@ -129,64 +145,53 @@ function App() {
           </div>
           <div style={{ fontSize: 11, color: "#555", marginTop: 4 }}>Real-time Camera Monitor</div>
         </div>
-        <div style={{
-          fontSize: 11, color: status.includes("연결됨") ? "#4CAF50" : "#888",
-          display: "flex", alignItems: "center", gap: 6
-        }}>
-          <div style={{
-            width: 8, height: 8, borderRadius: "50%",
-            background: status.includes("연결됨") ? "#4CAF50" : "#555"
-          }} />
-          {status}
+        <div style={{ fontSize: 11, color: statusColor, display: "flex", alignItems: "center", gap: 6 }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor }} />
+          {statusText[status]}
         </div>
       </div>
 
-      {/* 카메라 없음 */}
+      {/* No cameras */}
       {cameras.length === 0 && (
         <div style={{
           background: "#11141c", borderRadius: 12, padding: 40,
           textAlign: "center", color: "#555", fontSize: 14
         }}>
           <div style={{ fontSize: 40, marginBottom: 16 }}>📷</div>
-          <div style={{ marginBottom: 8 }}>연결된 카메라가 없습니다</div>
+          <div style={{ marginBottom: 8 }}>No cameras connected</div>
           <div style={{ fontSize: 11, color: "#444" }}>
-            SungwonCam 앱에서 스트리밍을 시작하세요
+            Start SungwonCam app on your phone
           </div>
         </div>
       )}
 
-      {/* 카메라 그리드 */}
+      {/* Camera grid */}
       <div style={{
         display: "grid",
         gridTemplateColumns: cameras.length === 1 ? "1fr" : "repeat(auto-fill, minmax(400px, 1fr))",
         gap: 16
       }}>
         {cameras.map(cam => (
-          <div key={cam.id} style={{
-            background: "#11141c", borderRadius: 12, overflow: "hidden"
-          }}>
-            {/* 비디오 */}
+          <div key={cam.id} style={{ background: "#11141c", borderRadius: 12, overflow: "hidden" }}>
             <div style={{ position: "relative", width: "100%", paddingTop: "56.25%", background: "#000" }}>
               <video
                 ref={el => videoRefs.current[cam.id] = el}
-                autoPlay
-                playsInline
-                muted
+                autoPlay playsInline muted
                 style={{
                   position: "absolute", top: 0, left: 0,
                   width: "100%", height: "100%", objectFit: "contain"
                 }}
               />
-              {/* 오버레이 */}
-              <div style={{
-                position: "absolute", top: 8, left: 12,
-                background: "rgba(0,0,0,0.6)", borderRadius: 4,
-                padding: "3px 8px", fontSize: 10, color: "#4CAF50"
-              }}>
-                LIVE
-              </div>
+              {status === "connected" && (
+                <div style={{
+                  position: "absolute", top: 8, left: 12,
+                  background: "rgba(0,0,0,0.6)", borderRadius: 4,
+                  padding: "3px 8px", fontSize: 10, color: "#f44"
+                }}>
+                  ● LIVE
+                </div>
+              )}
             </div>
-            {/* 하단 */}
             <div style={{ padding: "12px 16px", display: "flex", alignItems: "center" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ color: "#fff", fontSize: 14, fontWeight: 600 }}>{cam.name}</div>
@@ -194,27 +199,21 @@ function App() {
                   {new Date(cam.created_at).toLocaleString("ko-KR")}
                 </div>
               </div>
-              <button
-                onClick={() => requestStream(cam.id)}
+              <button onClick={() => requestStream(cam.id)}
                 style={{
                   background: "#f5c518", color: "#000", border: "none",
                   borderRadius: 6, padding: "8px 16px", fontSize: 12,
                   fontWeight: 700, cursor: "pointer"
-                }}
-              >
-                연결
+                }}>
+                Connect
               </button>
             </div>
           </div>
         ))}
       </div>
 
-      {/* 푸터 */}
-      <div style={{
-        textAlign: "center", color: "#333", fontSize: 10,
-        marginTop: 40, padding: 20
-      }}>
-        Sungwon Station v1.0 — Powered by DodoStation
+      <div style={{ textAlign: "center", color: "#333", fontSize: 10, marginTop: 40, padding: 20 }}>
+        Sungwon Station v1.0
       </div>
     </div>
   );
