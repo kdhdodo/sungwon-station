@@ -41,12 +41,13 @@ function App() {
       delete pollRefs.current[camId];
     }
 
-    // request-stream 시그널 보내기
+    // 기존 시그널 정리 후 request 보내기
+    await supabase.from("sw_signals").delete().eq("cam_id", camId);
     await supabase.from("sw_signals").insert({
       cam_id: camId, type: "request-stream", data: "request"
     });
 
-    // 시그널 폴링 시작
+    // 시그널 폴링 시작 (request 이후 시그널만)
     let lastId = 0;
     pollRefs.current[camId] = setInterval(async () => {
       const { data: signals } = await supabase.from("sw_signals")
